@@ -1,6 +1,6 @@
 # Run Neovim tests inside Neovim
 
-https://raw.githubusercontent.com/lewis6991/media/main/nvim-test-demo.mp4
+<video src="https://raw.githubusercontent.com/lewis6991/media/main/nvim-test-demo.mp4" width="100%"></video>
 
 * Add virtual text for test results
 * Add virtual lines for failed test output immediately above the test.
