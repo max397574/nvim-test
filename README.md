@@ -5,9 +5,13 @@
 * Add virtual text for test results
 * Add virtual lines for failed test output immediately above the test.
 
+## Requirements
+
+plenary.nvim
+
 ## Commands
 
-`RunTest`: Run the test in the buffer the cursor is inside. Works for `it` and `describe` blocks.
+`RunTest [all]`: Run the test in the buffer the cursor is inside. Works for `it` and `describe` blocks.
 
 `RunTestClear`: Clear test result decorations in buffer
 

@@ -1,20 +1,28 @@
+local async = require('plenary.async.async')
+local scheduler = require('plenary.async.util').scheduler
+
 local api = vim.api
 
 local ns = api.nvim_create_namespace('nvim_test')
 
-
-local function get_test_lnum(lnum)
+local function get_test_lnum(lnum, inc_describe)
+  lnum =  lnum or vim.fn.line('.')
   local test
   local test_lnum
   for i = lnum, 1, -1 do
-    test = vim.fn.getline(i):match("^%s*it%s*%(%s*['\"](.*)['\"']%s*,")
-    if test then
-      test_lnum = i
-      break
+    for _, pat in ipairs {
+      "^%s*it%s*%(%s*['\"](.*)['\"']%s*,",
+      inc_describe and "^%s*describe%s*%(%s*['\"](.*)['\"']%s*,"
+    } do
+      if pat then
+        test = vim.fn.getline(i):match(pat)
+        if test then
+          test_lnum = i
+          break
+        end
+      end
     end
-    test = vim.fn.getline(i):match("^%s*describe%s*%(%s*['\"](.*)['\"']%s*,")
     if test then
-      test_lnum = i
       break
     end
   end
@@ -22,24 +30,66 @@ local function get_test_lnum(lnum)
   return test, test_lnum
 end
 
+local function get_test_lnums(all)
+  local lnum = vim.fn.line(all and '$' or '.')
+
+  local res = {}
+  repeat
+    local test, test_lnum = get_test_lnum(lnum, false)
+    if test then
+      res[#res+1] = {test, test_lnum}
+      if not all then
+        break
+      end
+      lnum = test_lnum - 1
+    end
+  until not test
+
+  return res
+end
+
+local function filter_test_output(in_lines)
+  local lines = {}
+  local collect = false
+  for _, l in ipairs(in_lines) do
+    if not collect and l:match('%[ RUN') then
+      collect = true
+    end
+    if collect and l ~= '' then
+      if l:match('Tests exited non%-zero:') then
+        break
+      end
+      lines[#lines+1] = l
+    end
+  end
+
+  if #lines == 0 then
+    lines = in_lines
+  end
+  return lines
+end
+
+local function create_virt_lines(lines)
+  local virt_lines = {}
+  for _, l in ipairs(lines) do
+    virt_lines[#virt_lines+1] = {{l, 'ErrorMsg'}}
+  end
+  return virt_lines
+end
+
 local function apply_decor(bufnr, lnum, code, stdout)
   local virt_text, virt_lines
+
   if code > 0 then
     virt_text = {'FAILED', 'ErrorMsg' }
-    virt_lines = {}
-    local collect = false
-    for _, l in ipairs(vim.split(stdout, '\n')) do
-      if not collect and l:match('%[ RUN') then
-        collect = true
-      end
-      if collect and l ~= '' then
-        virt_lines[#virt_lines+1] = {{l, 'ErrorMsg'}}
-      end
-    end
 
+    local stdout_lines = vim.split(stdout, '\n')
+    local lines = filter_test_output(stdout_lines)
+    virt_lines = create_virt_lines(lines)
   else
     virt_text = {'PASSED', 'MoreMsg' }
   end
+
   api.nvim_buf_set_extmark(bufnr, ns, lnum-1, -1, {
     id = lnum,
     virt_text = {virt_text},
@@ -52,22 +102,7 @@ local function notify_err(msg)
   vim.notify(msg, vim.log.levels.ERROR)
 end
 
-local function run_nvim_test()
-  local name = api.nvim_buf_get_name(0)
-  if not name:match('^.*/test/functional/.*$') then
-    notify_err('Buffer is not an nvim functional test file')
-    return
-  end
-
-  local lnum = vim.fn.line('.')
-  local test, test_lnum = get_test_lnum(lnum)
-
-  if not test then
-    notify_err('Could not find test')
-    return
-  end
-
-  local cbuf = api.nvim_get_current_buf()
+local run_target = async.wrap(function(cwd, path, test, callback)
   local stdout = vim.loop.new_pipe(false)
   local stderr = vim.loop.new_pipe(false)
 
@@ -76,9 +111,10 @@ local function run_nvim_test()
   vim.loop.spawn('make', {
     args = {
       'functionaltest',
-      'TEST_FILE='..name,
+      'TEST_FILE='..path,
       'TEST_FILTER='..test
     },
+    cwd = cwd,
     stdio = { nil, stdout, stderr },
   },
     function(code)
@@ -88,9 +124,7 @@ local function run_nvim_test()
       if stdout and not stdout:is_closing() then stdout:close() end
       if stderr and not stderr:is_closing() then stderr:close() end
 
-      vim.schedule(function()
-        apply_decor(cbuf, test_lnum, code, stdout_data)
-      end)
+      callback(code, stdout_data)
     end
   )
 
@@ -105,15 +139,42 @@ local function run_nvim_test()
       stdout_data = stdout_data..data
     end
   end)
-end
+end, 4)
 
-vim.api.nvim_add_user_command('RunTest', run_nvim_test, {
+local run_nvim_test = async.void(function(props)
+  local all = props.args == 'all'
+
+  local name = api.nvim_buf_get_name(0)
+  if not name:match('^.*/test/functional/.*$') then
+    notify_err('Buffer is not an nvim functional test file')
+    return
+  end
+
+  local targets = get_test_lnums(all)
+
+  if #targets == 0 then
+    notify_err('Could not find test')
+    return
+  end
+
+  local cwd = name:match('^(.*)/test/functional/.*$')
+  local cbuf = api.nvim_get_current_buf()
+
+  for i = #targets, 1, -1 do
+    local test, test_lnum = unpack(targets[i])
+    local code, stdout = run_target(cwd, name, test)
+    scheduler()
+    apply_decor(cbuf, test_lnum, code, stdout)
+  end
+end)
+
+api.nvim_add_user_command('RunTest', run_nvim_test, {
   force=true,
   nargs='*' -- shouldn't need this. Must be a bug.
 })
 
-vim.api.nvim_add_user_command('RunTestClear', function()
-  vim.api.nvim_buf_clear_namespace(0, ns, 0, -1)
+api.nvim_add_user_command('RunTestClear', function()
+  api.nvim_buf_clear_namespace(0, ns, 0, -1)
   vim.cmd'redraw'
 end, {
   force=true,
